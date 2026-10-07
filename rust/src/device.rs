@@ -81,6 +81,22 @@ pub struct AudioSource {
     pub source_mac: Option<String>,
 }
 
+/// A device in the headphones' own pairing list, from DeviceManagement
+/// ListDevices [4.4] + Info [4.5].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedDevice {
+    /// "XX:XX:XX:XX:XX:XX".
+    pub mac: String,
+    /// Name the device gave the headphones (UTF-8).
+    pub name: String,
+    /// Currently connected to the headphones.
+    pub connected: bool,
+    /// The device this connection comes from.
+    pub local: bool,
+    /// Raw Info payload bytes.
+    pub raw: Vec<u8>,
+}
+
 /// Full device status snapshot.
 #[derive(Debug, Clone)]
 pub struct DeviceStatus {
@@ -129,12 +145,23 @@ pub struct DeviceConfig {
     pub anr: Option<Addr>,
     pub pairing: Option<Addr>,
     pub routing: Option<Addr>,
+    /// DeviceManagement Connect [4.1] START: [0x00, mac(6)].
+    pub device_connect: Option<Addr>,
+    /// DeviceManagement Disconnect [4.2] START: mac(6); answers nothing.
+    pub device_disconnect: Option<Addr>,
+    /// DeviceManagement ListDevices [4.4] GET: [unknown, mac(6) * N].
+    pub device_list: Option<Addr>,
+    /// DeviceManagement Info [4.5] GET with a MAC: [mac(6), flags, ?, ?, name].
+    pub device_info: Option<Addr>,
     pub source: Option<Addr>,
     pub power: Option<Addr>,
     pub get_all_modes: Option<Addr>,
     pub current_mode: Option<Addr>,
     pub mode_config: Option<Addr>,
     pub favorites: Option<Addr>,
+    /// AudioModes FblockInfo [31.0]: answers where the block is served.
+    /// Firmware 2.0.4 on the QC Ultra 2 refuses the whole block.
+    pub audio_modes_info: Option<Addr>,
     /// AudioModesSettingsConfig [31.10] — direct CNC/spatial/wind/ANC control.
     pub audio_settings: Option<Addr>,
     pub preset_modes: &'static [(&'static str, PresetMode)],
@@ -446,6 +473,72 @@ pub fn build_routing(mac_str: &str) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
+/// "XX:XX:XX:XX:XX:XX" -> 6 bytes.
+pub fn mac_to_bytes(mac_str: &str) -> Result<[u8; 6], String> {
+    let parts: Vec<&str> = mac_str.split(':').collect();
+    let invalid = || format!("MAC must be XX:XX:XX:XX:XX:XX, got {:?}", mac_str);
+    if parts.len() != 6 || parts.iter().any(|p| p.len() != 2) {
+        return Err(invalid());
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).map_err(|_| invalid())?;
+    }
+    Ok(mac)
+}
+
+/// 6 bytes -> "XX:XX:XX:XX:XX:XX".
+pub fn bytes_to_mac(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":")
+}
+
+/// Parse DeviceManagement ListDevices [4.4] STATUS.
+///
+/// Layout (QC Ultra 2, firmware 2.0.4): [unknown, mac0(6), mac1(6), ...].
+/// The leading byte is not needed, since Info [4.5] reports each device's
+/// state. Returns the MACs in the device's order; a trailing partial entry
+/// is ignored.
+pub fn parse_device_list(payload: &[u8]) -> Vec<String> {
+    payload.get(1..).unwrap_or(&[]).chunks_exact(6).map(bytes_to_mac).collect()
+}
+
+/// Parse DeviceManagement Info [4.5] STATUS.
+///
+/// Layout: [mac(6), flags, unknown, unknown, name(UTF-8)...]. Flags bit 0 is
+/// "connected"; bit 1 marks the device this connection comes from. The two
+/// unknown bytes vary by device type and are kept in `raw`.
+pub fn parse_device_info(payload: &[u8]) -> Result<PairedDevice, String> {
+    if payload.len() < 9 {
+        return Err(format!("Device info too short ({} bytes)", payload.len()));
+    }
+    let flags = payload[6];
+    Ok(PairedDevice {
+        mac: bytes_to_mac(&payload[0..6]),
+        name: String::from_utf8_lossy(&payload[9..]).into_owned(),
+        connected: flags & 0x01 != 0,
+        local: flags & 0x02 != 0,
+        raw: payload.to_vec(),
+    })
+}
+
+/// DeviceManagement Info [4.5] GET payload: the device's MAC.
+pub fn build_device_info(mac_str: &str) -> Result<Vec<u8>, String> {
+    Ok(mac_to_bytes(mac_str)?.to_vec())
+}
+
+/// DeviceManagement Connect [4.1] START payload: [0x00, mac(6)].
+/// A bare MAC is refused with a Length error.
+pub fn build_device_connect(mac_str: &str) -> Result<Vec<u8>, String> {
+    let mut payload = vec![0x00u8];
+    payload.extend_from_slice(&mac_to_bytes(mac_str)?);
+    Ok(payload)
+}
+
+/// DeviceManagement Disconnect [4.2] START payload: the device's MAC.
+pub fn build_device_disconnect(mac_str: &str) -> Result<Vec<u8>, String> {
+    Ok(mac_to_bytes(mac_str)?.to_vec())
+}
+
 /// Build a button remap SETGET payload: [buttonId, eventType, actionMode].
 pub fn build_buttons(button_id: u8, event: u8, action: u8) -> Vec<u8> {
     vec![button_id, event, action]
@@ -637,6 +730,41 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn test_parse_device_list() {
+        assert_eq!(
+            parse_device_list(&decode_hex("03001122334401001122334402")),
+            vec!["00:11:22:33:44:01".to_string(), "00:11:22:33:44:02".to_string()],
+        );
+        assert!(parse_device_list(&[]).is_empty());
+        assert!(parse_device_list(&[0x00, 0x11, 0x22]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_device_info() {
+        let d = parse_device_info(&decode_hex("0011223344010301036c6170746f70")).unwrap();
+        assert_eq!(d.mac, "00:11:22:33:44:01");
+        assert_eq!(d.name, "laptop");
+        assert!(d.connected && d.local);
+        let d = parse_device_info(&decode_hex("001122334403000103")).unwrap();
+        assert_eq!(d.name, "");
+        assert!(!d.connected && !d.local);
+        assert!(parse_device_info(&decode_hex("0011223344030001")).is_err());
+    }
+
+    #[test]
+    fn test_device_management_builders() {
+        assert_eq!(build_device_info("00:11:22:33:44:02").unwrap(),
+                   decode_hex("001122334402"));
+        assert_eq!(build_device_connect("00:11:22:33:44:02").unwrap(),
+                   decode_hex("00001122334402"));
+        assert_eq!(build_device_disconnect("aa:bb:cc:dd:ee:ff").unwrap(),
+                   decode_hex("aabbccddeeff"));
+        assert!(build_device_connect("not-a-mac").is_err());
+        assert!(build_device_connect("0:11:22:33:44:02").is_err());
+        assert!(build_device_connect("00:11:22:33:44:GG").is_err());
     }
 
     #[test]

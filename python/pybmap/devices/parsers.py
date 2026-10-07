@@ -11,7 +11,9 @@ from ..constants import (
     SOURCE_TYPES,
 )
 from ..protocol import encode_mode_name
-from ..types import ModeConfig, EqBand, ButtonMapping, AudioSource, AudioSettings
+from ..types import (
+    ModeConfig, EqBand, ButtonMapping, AudioSource, AudioSettings, PairedDevice,
+)
 
 
 # ── Standard Parsers ─────────────────────────────────────────────────────────
@@ -270,6 +272,70 @@ def build_routing(mac_str):
     if len(mac_bytes) != 6:
         raise ValueError("MAC must be 6 bytes (XX:XX:XX:XX:XX:XX)")
     return bytes([0x82]) + mac_bytes
+
+
+def mac_to_bytes(mac_str):
+    """"XX:XX:XX:XX:XX:XX" -> 6 bytes. Raises ValueError otherwise."""
+    parts = str(mac_str).split(":")
+    if len(parts) != 6 or any(len(p) != 2 for p in parts):
+        raise ValueError("MAC must be XX:XX:XX:XX:XX:XX, got %r" % mac_str)
+    return bytes(int(p, 16) for p in parts)
+
+
+def bytes_to_mac(data):
+    return ":".join("%02X" % b for b in data)
+
+
+def parse_device_list(payload):
+    """Parse DeviceManagement ListDevices [4.4] STATUS.
+
+    Layout (QC Ultra 2, firmware 2.0.4): [unknown, mac0(6), mac1(6), ...].
+    The leading byte was 0x03 with the first two entries connected; it is
+    not needed, since Info [4.5] reports each device's state. Returns a list
+    of MAC strings in the device's order.
+    """
+    body = payload[1:]
+    return [bytes_to_mac(body[i:i + 6]) for i in range(0, len(body) - 5, 6)]
+
+
+def parse_device_info(payload):
+    """Parse DeviceManagement Info [4.5] STATUS.
+
+    Layout: [mac(6), flags, unknown, unknown, name(UTF-8)...]. Flags bit 0 is
+    "connected"; bit 1 marks the device this connection comes from (it stays
+    on the local host while another device is the active source). The two
+    unknown bytes vary by device type (phone 0x02, computer and tablet 0x01,
+    TV 0x04 in the first) and are kept in `raw`.
+    """
+    if len(payload) < 9:
+        raise ValueError("Device info too short (%d bytes)" % len(payload))
+    flags = payload[6]
+    return PairedDevice(
+        mac=bytes_to_mac(payload[0:6]),
+        name=payload[9:].decode("utf-8", errors="replace"),
+        connected=bool(flags & 0x01),
+        local=bool(flags & 0x02),
+        raw=bytes(payload),
+    )
+
+
+def build_device_info(mac_str):
+    """DeviceManagement Info [4.5] GET payload: the device's MAC."""
+    return mac_to_bytes(mac_str)
+
+
+def build_device_connect(mac_str):
+    """DeviceManagement Connect [4.1] START payload: [0x00, mac(6)].
+
+    A bare MAC is refused with a Length error; with the leading 0x00 the
+    headphones answer PROCESSING and connect the device.
+    """
+    return bytes([0x00]) + mac_to_bytes(mac_str)
+
+
+def build_device_disconnect(mac_str):
+    """DeviceManagement Disconnect [4.2] START payload: the device's MAC."""
+    return mac_to_bytes(mac_str)
 
 
 # ── ModeConfig Parsers/Builders (device-specific, but share common patterns)

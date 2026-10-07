@@ -33,7 +33,7 @@ from .errors import (
 )
 from .types import (
     BatteryReading, BatteryStatus, BmapResponse, ButtonMapping, DeviceStatus,
-    EqBand, ModeConfig,
+    EqBand, ModeConfig, PairedDevice,
 )
 from .protocol import bmap_packet, parse_response, parse_all_responses
 from .constants import OP_STATUS

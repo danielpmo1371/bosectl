@@ -570,6 +570,27 @@ From `DeviceManagementPackets.java`:
 | 11 | P2PMode | |
 | 12 | Routing | Switch active multipoint device |
 
+### DeviceManagement on QC Ultra 2, firmware 2.0.4 (observed)
+Verified against a live headset (`bosectl devices`, `connect`, `disconnect`):
+
+- **ListDevices [4.4] GET**: `[unknown, mac(6) * N]`. The leading byte was
+  `0x03` while the first two entries were connected.
+- **Info [4.5] GET** with the MAC as payload: `[mac(6), flags, b7, b8, name...]`.
+  Flags bit 0 = connected, bit 1 = the host asking (it stayed on the local
+  host while a phone was the active source). `b7` looked like a device type
+  (phone 0x02, computer/tablet 0x01, TV 0x04); `b8` is unknown.
+- **Connect [4.1] START**: `[0x00, mac(6)]` answers PROCESSING and connects.
+  A bare MAC is refused with Length (01).
+- **Disconnect [4.2] START**: `mac(6)`; takes effect with no reply inside
+  the 3 s transport timeout.
+- **Routing [4.12] START**: FuncNotSupp (04) on this firmware.
+- **Source [5.1]** reports `00:00:00:00:00:00` while nothing is routed.
+- **AudioModes (31)**: every request, GET included, is refused with
+  FblockNotSupp (03); [31.0] too. The current mode still arrives as an
+  unsolicited STATUS on connect, so `bosectl current` works, but modes, CNC
+  (written through [31.10]) and spatial cannot be changed. Settings (1)
+  writes such as EQ still work.
+
 ## BMAP Error Codes
 | Code | Name             | Description |
 |------|------------------|-------------|

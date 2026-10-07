@@ -87,7 +87,13 @@ impl<T: Transport> BmapConnection<T> {
     }
 
     fn get(&self, addr: Addr) -> BmapResult<Vec<u8>> {
-        let pkt = bmap_packet(addr.0, addr.1, Operator::Get, &[]);
+        self.get_with(addr, &[])
+    }
+
+    /// GET carrying a payload: some GETs name what they ask about (Info
+    /// [4.5] takes the device's MAC).
+    fn get_with(&self, addr: Addr, payload: &[u8]) -> BmapResult<Vec<u8>> {
+        let pkt = bmap_packet(addr.0, addr.1, Operator::Get, payload);
         let data = self.transport.send_recv(&pkt)?;
         Ok(self.check_reply(&data, addr)?.payload)
     }
@@ -367,6 +373,11 @@ impl<T: Transport> BmapConnection<T> {
             "auto_answer" => self.config.auto_answer.is_some(),
             "anr" => self.config.anr.is_some(),
             "routing" => self.config.routing.is_some(),
+            "device_connect" => self.config.device_connect.is_some(),
+            "device_disconnect" => self.config.device_disconnect.is_some(),
+            "device_list" => self.config.device_list.is_some(),
+            "device_info" => self.config.device_info.is_some(),
+            "audio_modes_info" => self.config.audio_modes_info.is_some(),
             "source" => self.config.source.is_some(),
             "audio_settings" => self.config.audio_settings.is_some(),
             "mode_config" => self.config.mode_config.is_some(),
@@ -589,6 +600,65 @@ impl<T: Transport> BmapConnection<T> {
             .map_err(|e| BmapError::InvalidArg(e))?;
         self.start(addr, &payload)?;
         Ok(())
+    }
+
+    /// The headphones' own pairing list.
+    ///
+    /// ListDevices [4.4] gives the MACs; Info [4.5] is asked per device for
+    /// its name and whether it is connected.
+    pub fn paired_devices(&self) -> BmapResult<Vec<PairedDevice>> {
+        let list_addr = self.addr(self.config.device_list)?;
+        let info_addr = self.addr(self.config.device_info)?;
+        let macs = parse_device_list(&self.get(list_addr)?);
+        macs.iter()
+            .map(|mac| {
+                let request = build_device_info(mac).map_err(BmapError::InvalidArg)?;
+                let payload = self.get_with(info_addr, &request)?;
+                parse_device_info(&payload)
+                    .map_err(|message| BmapError::Device { message, code: 0 })
+            })
+            .collect()
+    }
+
+    /// Ask the headphones to connect a device from their pairing list.
+    ///
+    /// Connect [4.1] answers PROCESSING and the link comes up a few seconds
+    /// later; read `paired_devices()` to see it land.
+    pub fn connect_device(&self, mac: &str) -> BmapResult<()> {
+        let addr = self.addr(self.config.device_connect)?;
+        let payload = build_device_connect(mac).map_err(BmapError::InvalidArg)?;
+        self.start(addr, &payload)?;
+        Ok(())
+    }
+
+    /// Ask the headphones to drop a connected device.
+    ///
+    /// Disconnect [4.2] takes effect without a reply inside the transport's
+    /// timeout, so silence is not a failure; an ERROR reply still is.
+    pub fn disconnect_device(&self, mac: &str) -> BmapResult<()> {
+        let addr = self.addr(self.config.device_disconnect)?;
+        let payload = build_device_disconnect(mac).map_err(BmapError::InvalidArg)?;
+        match self.start(addr, &payload) {
+            Ok(_) | Err(BmapError::Timeout(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether the AudioModes block (31) answers requests.
+    ///
+    /// Firmware 2.0.4 on the QC Ultra 2 refuses the whole block, so modes,
+    /// CNC and spatial cannot be changed even though the current mode is
+    /// still reported. False also for devices without the block.
+    pub fn audio_modes_available(&self) -> BmapResult<bool> {
+        let addr = match self.config.audio_modes_info {
+            Some(addr) => addr,
+            None => return Ok(false),
+        };
+        match self.get(addr) {
+            Ok(_) => Ok(true),
+            Err(BmapError::Device { .. }) | Err(BmapError::Auth(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Enter pairing mode.
@@ -1381,5 +1451,156 @@ mod tests {
         t.responses.insert((1, 7), vec![0, 5, 0x03, 1, 0x34]);
         let dev = BmapConnection::new(t, devices::qc_ultra2());
         assert!(matches!(dev.status(), Err(BmapError::Desync(_))));
+    }
+
+    // ── Device management (QC Ultra 2 fw 2.0.4) ───────────────────────────
+
+    const PHONE: &str = "00:11:22:33:44:02";
+    const HOST: &str = "00:11:22:33:44:01";
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Answers Info [4.5] per MAC named in the request; silent mode never
+    /// answers, as Disconnect [4.2] does on the QC Ultra 2.
+    struct DevMgmtTransport {
+        inner: MockTransport,
+        infos: HashMap<String, Vec<u8>>,
+        silent: bool,
+    }
+
+    impl DevMgmtTransport {
+        fn new() -> Self {
+            Self { inner: MockTransport::new(), infos: HashMap::new(), silent: false }
+        }
+    }
+
+    impl Transport for DevMgmtTransport {
+        fn send_recv(&self, packet: &[u8]) -> BmapResult<Vec<u8>> {
+            if self.silent {
+                self.inner.sent.borrow_mut().push(packet.to_vec());
+                return Err(BmapError::Timeout("No response from device".into()));
+            }
+            if packet[0] == 4 && packet[1] == 5 {
+                self.inner.sent.borrow_mut().push(packet.to_vec());
+                let payload = &self.infos[&bytes_to_mac(&packet[4..10])];
+                let mut resp = vec![4, 5, 0x03, payload.len() as u8];
+                resp.extend_from_slice(payload);
+                return Ok(resp);
+            }
+            self.inner.send_recv(packet)
+        }
+
+        fn send_recv_drain(&self, packet: &[u8]) -> BmapResult<Vec<u8>> {
+            self.send_recv(packet)
+        }
+    }
+
+    fn sent(dev: &BmapConnection<DevMgmtTransport>) -> Vec<Vec<u8>> {
+        dev.transport.inner.sent.borrow().clone()
+    }
+
+    #[test]
+    fn test_paired_devices_lists_name_and_state() {
+        let mut t = DevMgmtTransport::new();
+        t.infos.insert(HOST.into(), hex("0011223344010301036c6170746f70"));
+        t.infos.insert(PHONE.into(),
+            hex("0011223344020102034f776e6572e28099732050686f6e65"));
+        t.inner.add(4, 4, 0x03, &hex("03001122334401001122334402"));
+        let devices = BmapConnection::new(t, devices::qc_ultra2()).paired_devices().unwrap();
+        let macs: Vec<&str> = devices.iter().map(|d| d.mac.as_str()).collect();
+        assert_eq!(macs, vec![HOST, PHONE]);
+        assert_eq!(devices[0].name, "laptop");
+        assert!(devices[0].connected && devices[0].local);
+        assert_eq!(devices[1].name, "Owner\u{2019}s Phone");
+        assert!(devices[1].connected && !devices[1].local);
+    }
+
+    #[test]
+    fn test_info_request_names_the_device() {
+        let mut t = DevMgmtTransport::new();
+        t.infos.insert(PHONE.into(), hex("00112233440200020344"));
+        t.inner.add(4, 4, 0x03, &hex("03001122334402"));
+        let dev = BmapConnection::new(t, devices::qc_ultra2());
+        let devices = dev.paired_devices().unwrap();
+        assert_eq!(sent(&dev)[1], hex("04050106001122334402"));
+        assert!(!devices[0].connected);
+    }
+
+    #[test]
+    fn test_short_device_info_is_an_error() {
+        let mut t = DevMgmtTransport::new();
+        t.infos.insert(PHONE.into(), hex("0011223344020102"));
+        t.inner.add(4, 4, 0x03, &hex("03001122334402"));
+        let dev = BmapConnection::new(t, devices::qc_ultra2());
+        assert!(matches!(dev.paired_devices(), Err(BmapError::Device { .. })));
+    }
+
+    #[test]
+    fn test_connect_sends_flag_byte_then_mac() {
+        let mut t = DevMgmtTransport::new();
+        t.inner.add(4, 1, 0x07, &hex("001122334402"));  // PROCESSING
+        let dev = BmapConnection::new(t, devices::qc_ultra2());
+        dev.connect_device(PHONE).unwrap();
+        assert_eq!(sent(&dev)[0], hex("0401050700001122334402"));
+    }
+
+    #[test]
+    fn test_connect_error_raises() {
+        let mut t = DevMgmtTransport::new();
+        t.inner.add(4, 1, 0x04, &[1]);
+        let dev = BmapConnection::new(t, devices::qc_ultra2());
+        assert!(matches!(dev.connect_device(PHONE), Err(BmapError::Device { code: 1, .. })));
+    }
+
+    #[test]
+    fn test_disconnect_silence_is_not_failure() {
+        let mut t = DevMgmtTransport::new();
+        t.silent = true;
+        let dev = BmapConnection::new(t, devices::qc_ultra2());
+        dev.disconnect_device(PHONE).unwrap();
+        assert_eq!(sent(&dev)[0], hex("04020506001122334402"));
+    }
+
+    #[test]
+    fn test_disconnect_error_raises() {
+        let mut t = DevMgmtTransport::new();
+        t.inner.add(4, 2, 0x04, &[4]);
+        let dev = BmapConnection::new(t, devices::qc_ultra2());
+        assert!(matches!(dev.disconnect_device(PHONE), Err(BmapError::Device { code: 4, .. })));
+    }
+
+    #[test]
+    fn test_bad_mac_rejected_before_sending() {
+        let dev = BmapConnection::new(DevMgmtTransport::new(), devices::qc_ultra2());
+        assert!(matches!(dev.connect_device("not-a-mac"), Err(BmapError::InvalidArg(_))));
+        assert!(sent(&dev).is_empty());
+    }
+
+    #[test]
+    fn test_audio_modes_refused_block() {
+        let mut t = MockTransport::new();
+        t.add(31, 0, 0x04, &[3]);  // FblockNotSupp
+        let dev = BmapConnection::new(t, devices::qc_ultra2());
+        assert!(!dev.audio_modes_available().unwrap());
+    }
+
+    #[test]
+    fn test_audio_modes_served_block() {
+        let mut t = MockTransport::new();
+        t.add(31, 0, 0x03, b"1.1.0");
+        let dev = BmapConnection::new(t, devices::qc_ultra2());
+        assert!(dev.audio_modes_available().unwrap());
+    }
+
+    #[test]
+    fn test_audio_modes_unavailable_without_feature() {
+        let dev = BmapConnection::new(MockTransport::new(), devices::qc35());
+        assert!(!dev.audio_modes_available().unwrap());
+        assert!(dev.transport.sent.borrow().is_empty());
     }
 }

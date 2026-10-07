@@ -19,7 +19,7 @@ from .constants import (
 from .protocol import bmap_packet, parse_all_responses, fmt_response
 from .errors import (
     BmapError, BmapAuthError, BmapDeviceError, BmapDesyncError,
-    BmapInvalidArgError,
+    BmapInvalidArgError, BmapTimeoutError,
 )
 from .types import AudioSettings, BatteryStatus, DeviceStatus
 from .devices import parsers
@@ -97,11 +97,15 @@ class BmapConnection:
             self._raise_error(parsed)
         return parsed
 
-    def _get_payload(self, feature_name):
-        """Send a GET request and return its raw payload."""
+    def _get_payload(self, feature_name, payload=b""):
+        """Send a GET request and return its raw payload.
+
+        Most GETs carry no payload; some name what they ask about (Info
+        [4.5] takes the device's MAC).
+        """
         feat = self._feature(feature_name)
         fblock, func = feat["addr"]
-        resp = self._transport.send_recv(bmap_packet(fblock, func, OP_GET))
+        resp = self._transport.send_recv(bmap_packet(fblock, func, OP_GET, payload))
         return self._check_reply(resp, fblock, func).payload
 
     def _get(self, feature_name):
@@ -564,6 +568,53 @@ class BmapConnection:
         builder = feat.get("builder")
         payload = builder(mac)
         self._start("routing", payload)
+
+    def paired_devices(self):
+        """The headphones' own pairing list. Returns a list of PairedDevice.
+
+        ListDevices [4.4] gives the MACs; Info [4.5] is asked per device for
+        its name and whether it is connected.
+        """
+        macs = parsers.parse_device_list(self._get_payload("device_list"))
+        info = self._feature("device_info")
+        return [info["parser"](self._get_payload("device_info", info["builder"](mac)))
+                for mac in macs]
+
+    def connect_device(self, mac):
+        """Ask the headphones to connect a device from their pairing list.
+
+        Connect [4.1] answers PROCESSING and the link comes up a few seconds
+        later; read paired_devices() to see it land.
+        """
+        feat = self._feature("device_connect")
+        self._start("device_connect", feat["builder"](mac))
+
+    def disconnect_device(self, mac):
+        """Ask the headphones to drop a connected device.
+
+        Disconnect [4.2] takes effect without a reply inside the transport's
+        timeout, so silence is not a failure; an ERROR reply still raises.
+        """
+        feat = self._feature("device_disconnect")
+        try:
+            self._start("device_disconnect", feat["builder"](mac))
+        except BmapTimeoutError:
+            pass
+
+    def audio_modes_available(self):
+        """Whether the AudioModes block (31) answers requests.
+
+        Firmware 2.0.4 on the QC Ultra 2 refuses the whole block, so modes,
+        CNC and spatial cannot be changed even though the current mode is
+        still reported. False also for devices without the block.
+        """
+        if not self.has_feature("audio_modes_info"):
+            return False
+        try:
+            self._get_payload("audio_modes_info")
+            return True
+        except (BmapDeviceError, BmapAuthError):
+            return False
 
     def pair(self):
         """Enter Bluetooth pairing mode."""

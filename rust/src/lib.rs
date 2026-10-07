@@ -24,7 +24,7 @@ pub use connection::BmapConnection;
 pub use transport::Transport;
 pub use device::{
     BatteryReading, BatteryStatus, ButtonMapping, DeviceConfig, DeviceStatus,
-    EqBand, ModeConfig,
+    EqBand, ModeConfig, PairedDevice,
 };
 pub use error::{BmapError, BmapResult};
 pub use protocol::{Operator, BmapResponse};
