@@ -6,10 +6,12 @@ from types import SimpleNamespace
 import pytest
 from pybmap.connection import BmapConnection
 from pybmap.protocol import bmap_packet
-from pybmap.constants import OP_GET, OP_SETGET, OP_STATUS, OP_RESULT, OP_ERROR
+from pybmap.constants import (
+    OP_GET, OP_SETGET, OP_STATUS, OP_RESULT, OP_ERROR, OP_PROCESSING,
+)
 from pybmap.errors import (
     BmapError, BmapAuthError, BmapDeviceError,
-    BmapDesyncError, BmapConnectionError, BmapInvalidArgError,
+    BmapDesyncError, BmapConnectionError, BmapInvalidArgError, BmapTimeoutError,
 )
 from pybmap.devices import qc_ultra2, qc_ultra2_earbuds, qc_prince, qc45
 from pybmap.types import ModeConfig
@@ -633,3 +635,95 @@ class TestStrayFrames:
         mock_dev._transport.responses[(1, 7)] = bytes([0, 5, OP_STATUS, 1, 0x34])
         with pytest.raises(BmapDesyncError):
             mock_dev.status()
+
+
+class TestDeviceManagement:
+    """Paired-device list and connect/disconnect, from QC Ultra 2 fw 2.0.4."""
+
+    PHONE = "C0:6C:0C:19:53:1D"
+    HOST = "58:1C:F8:51:F3:14"
+
+    def _dev(self, transport):
+        return BmapConnection(transport, qc_ultra2)
+
+    def test_paired_devices_lists_name_and_state(self):
+        transport = InfoTransport({
+            self.HOST: bytes.fromhex("581cf851f3140301036e7576656d"),
+            self.PHONE: bytes.fromhex("c06c0c19531d01020344616e69656ce2809973206950686f6e65"),
+        })
+        transport.add_response(4, 4, OP_STATUS, bytes.fromhex("03581cf851f314c06c0c19531d"))
+        devices = self._dev(transport).paired_devices()
+        assert [d.mac for d in devices] == [self.HOST, self.PHONE]
+        assert devices[0].name == "nuvem" and devices[0].connected and devices[0].local
+        assert devices[1].name == "Daniel’s iPhone"
+        assert devices[1].connected and not devices[1].local
+
+    def test_info_request_names_the_device(self):
+        transport = InfoTransport({self.PHONE: bytes.fromhex("c06c0c19531d00020344")})
+        transport.add_response(4, 4, OP_STATUS, bytes.fromhex("03c06c0c19531d"))
+        devices = self._dev(transport).paired_devices()
+        assert transport.sent[1] == bytes.fromhex("04050106c06c0c19531d")
+        assert not devices[0].connected
+
+    def test_connect_sends_flag_byte_then_mac(self):
+        transport = MockTransport()
+        transport.add_response(4, 1, OP_PROCESSING, bytes.fromhex("c06c0c19531d"))
+        self._dev(transport).connect_device(self.PHONE)
+        assert transport.sent[0] == bytes.fromhex("0401050700c06c0c19531d")
+
+    def test_connect_error_raises(self):
+        transport = MockTransport()
+        transport.add_response(4, 1, OP_ERROR, bytes([1]))
+        with pytest.raises(BmapError):
+            self._dev(transport).connect_device(self.PHONE)
+
+    def test_disconnect_silence_is_not_failure(self):
+        transport = SilentTransport()
+        self._dev(transport).disconnect_device(self.PHONE)
+        assert transport.sent[0] == bytes.fromhex("04020506c06c0c19531d")
+
+    def test_disconnect_error_raises(self):
+        transport = MockTransport()
+        transport.add_response(4, 2, OP_ERROR, bytes([4]))
+        with pytest.raises(BmapError):
+            self._dev(transport).disconnect_device(self.PHONE)
+
+    def test_bad_mac_rejected_before_sending(self):
+        transport = MockTransport()
+        with pytest.raises(ValueError):
+            self._dev(transport).connect_device("not-a-mac")
+        assert transport.sent == []
+
+    def test_audio_modes_refused_block(self):
+        transport = MockTransport()
+        transport.add_response(31, 0, OP_ERROR, bytes([3]))  # FblockNotSupp
+        assert self._dev(transport).audio_modes_available() is False
+
+    def test_audio_modes_served_block(self):
+        transport = MockTransport()
+        transport.add_response(31, 0, OP_STATUS, b"1.1.0")
+        assert self._dev(transport).audio_modes_available() is True
+
+
+class InfoTransport(MockTransport):
+    """Answers Info [4.5] per MAC named in the request."""
+
+    def __init__(self, infos):
+        super().__init__()
+        self.infos = infos
+
+    def send_recv(self, packet, drain=False):
+        if packet[0] == 4 and packet[1] == 5:
+            self.sent.append(packet)
+            mac = ":".join("%02X" % b for b in packet[4:10])
+            payload = self.infos[mac]
+            return bytes([4, 5, OP_STATUS, len(payload)]) + payload
+        return super().send_recv(packet, drain)
+
+
+class SilentTransport(MockTransport):
+    """Never answers, as Disconnect [4.2] does on QC Ultra 2."""
+
+    def send_recv(self, packet, drain=False):
+        self.sent.append(packet)
+        raise BmapTimeoutError("No response from device")

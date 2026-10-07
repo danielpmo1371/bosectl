@@ -1,5 +1,6 @@
 """bosectl CLI — thin wrapper around the pybmap library."""
 
+import json
 import os
 import subprocess
 import sys
@@ -107,6 +108,80 @@ def cmd_status(dev):
     row("AutoPause", "on" if s.auto_pause else "off",
         C_GREEN if s.auto_pause else C_DIM)
     row("Prompts", "%s (%s)" % ("on" if s.prompts_enabled else "off", s.prompts_language))
+
+
+def _optional(read, default):
+    """A read the device may not support: its default instead of an error.
+
+    A dropped or desynced link still raises; that is not a missing feature.
+    """
+    try:
+        return read()
+    except BmapConnectionError:
+        raise
+    except BmapError:
+        return default
+
+
+def _devices_with_source(dev):
+    """Paired devices plus the active source's MAC, or ([], None)."""
+    source = _optional(dev.source, None)
+    active = source.source_mac if source else None
+    if active == "00:00:00:00:00:00":  # reported while nothing is routed
+        active = None
+    return _optional(dev.paired_devices, []), active
+
+
+def cmd_devices(dev):
+    devices, active = _devices_with_source(dev)
+    if not devices:
+        print("No paired devices reported")
+        return
+    for d in devices:
+        mark = "%s*%s" % (C_CYAN, C_RESET) if d.mac == active else " "
+        state = "connected" if d.connected else "paired"
+        color = C_GREEN if d.connected else C_DIM
+        local = "this" if d.local else ""
+        print("  %s %s  %s%-9s%s  %-4s  %s" % (mark, d.mac, color, state, C_RESET, local, d.name))
+
+
+def cmd_status_json(dev):
+    """One connection's worth of state as JSON, for scripts and panels."""
+    s = dev.status()
+    devices, active = _devices_with_source(dev)
+    audio_modes = dev.audio_modes_available()
+    profiles = []
+    if audio_modes:
+        modes = _optional(dev.modes, {})
+        profiles = [modes[idx].name for idx in sorted(modes)
+                    if modes[idx].editable is False or modes[idx].configured]
+    components = dev.battery_components
+    print(json.dumps({
+        "model": dev.device_info.get("name", "Unknown"),
+        "battery": s.battery,
+        "battery_parts": [
+            {"label": components.get(r.component_id, str(r.component_id)), "level": r.level}
+            for r in s.battery_readings if r.component_id in components
+        ],
+        "mode": s.mode,
+        "audio_modes": audio_modes,
+        "profiles": profiles,
+        "cnc": s.cnc_level,
+        "cnc_max": s.cnc_max,
+        "eq": [band.current for band in s.eq],
+        "name": s.name,
+        "firmware": s.firmware,
+        "sidetone": s.sidetone,
+        "multipoint": s.multipoint,
+        "auto_pause": s.auto_pause,
+        "prompts": s.prompts_enabled,
+        "source": active,
+        "devices": [
+            {"mac": d.mac, "name": d.name, "connected": d.connected,
+             "local": d.local, "active": d.mac == active}
+            for d in devices
+        ],
+    }, ensure_ascii=False))
 
 
 def cmd_profiles(dev):
@@ -293,6 +368,9 @@ def usage():
     section("Routing")
     cmd("source", "Show active audio source (BT/aux/none)")
     cmd("route <MAC>", "Switch active device (XX:XX:XX:XX:XX:XX)")
+    cmd("devices", "Paired devices; * = active source")
+    cmd("connect <MAC>", "Connect a paired device to the headphones")
+    cmd("disconnect <MAC>", "Disconnect a device from the headphones")
     print()
 
     section("Control")
@@ -301,7 +379,7 @@ def usage():
     print()
 
     section("Info")
-    cmd("status", "Show all settings")
+    cmd("status [--json]", "Show all settings (--json: plus devices, one line)")
     cmd("battery", "Battery percentage (just the number)")
     cmd("current", "Current mode name (just the word)")
     cmd("buttons", "Show button mapping")
@@ -358,7 +436,10 @@ def main():
             desc = dev.preset_modes[cmd].get("description", cmd)
             print("OK: %s" % desc)
         elif cmd == "status":
-            cmd_status(dev)
+            if "--json" in sys.argv[2:]:
+                cmd_status_json(dev)
+            else:
+                cmd_status(dev)
         elif cmd == "battery":
             print(dev.battery())
         elif cmd == "current":
@@ -462,6 +543,19 @@ def main():
                 sys.exit(1)
             dev.route(sys.argv[2])
             print("Routed to %s" % sys.argv[2])
+        elif cmd == "devices":
+            cmd_devices(dev)
+        elif cmd in ("connect", "disconnect"):
+            if len(sys.argv) < 3:
+                print("Usage: bosectl %s <XX:XX:XX:XX:XX:XX>" % cmd, file=sys.stderr)
+                sys.exit(1)
+            mac = sys.argv[2].upper()
+            if cmd == "connect":
+                dev.connect_device(mac)
+                print("Connecting %s" % mac)
+            else:
+                dev.disconnect_device(mac)
+                print("Disconnecting %s" % mac)
         elif cmd == "buttons":
             cmd_buttons(dev, sys.argv[2:])
         elif cmd == "pair":

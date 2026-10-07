@@ -94,6 +94,23 @@ FEATURES = {
     "pairing": {
         "addr": (4, 8),
     },
+    "device_connect": {
+        "addr": (4, 1),
+        "builder": parsers.build_device_connect,
+    },
+    "device_disconnect": {
+        "addr": (4, 2),
+        "builder": parsers.build_device_disconnect,
+    },
+    "device_list": {
+        "addr": (4, 4),
+        "parser": parsers.parse_device_list,
+    },
+    "device_info": {
+        "addr": (4, 5),
+        "parser": parsers.parse_device_info,
+        "builder": parsers.build_device_info,
+    },
     "routing": {
         "addr": (4, 12),
         "builder": parsers.build_routing,
@@ -106,6 +123,12 @@ FEATURES = {
         "addr": (7, 4),
     },
     # AudioModes block (31)
+    # FblockInfo: answers with a version string where the block is served.
+    # Firmware 2.0.4 refuses the whole block (FblockNotSupp) to requests,
+    # though it still pushes the current mode unsolicited on connect.
+    "audio_modes_info": {
+        "addr": (31, 0),
+    },
     "get_all_modes": {
         "addr": (31, 1),
     },

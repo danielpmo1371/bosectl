@@ -78,3 +78,13 @@ ButtonMapping = namedtuple("ButtonMapping", [
     "supported_actions",
     "raw",
 ])
+
+# A device in the headphones' own pairing list, from DeviceManagement
+# ListDevices [4.4] + Info [4.5].
+PairedDevice = namedtuple("PairedDevice", [
+    "mac",        # "XX:XX:XX:XX:XX:XX"
+    "name",       # Name the device gave the headphones (UTF-8)
+    "connected",  # Currently connected to the headphones (bool)
+    "local",      # The device this connection comes from (bool)
+    "raw",        # Raw Info payload bytes
+])

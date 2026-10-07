@@ -197,3 +197,60 @@ def test_busy_connect_skips_bluetooth_hint(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "Headphones busy" in err
     assert "Is Bluetooth on?" not in err
+
+
+class DevicesDevice(StatusDevice):
+    """StatusDevice plus the device-management reads, as fw 2.0.4 answers."""
+
+    device_info = {"name": "Bose QC Ultra Headphones 2"}
+    battery_components = {}
+
+    def __init__(self, source_mac="C0:6C:0C:19:53:1D", modes_served=False):
+        self.source_mac = source_mac
+        self.modes_served = modes_served
+
+    def source(self):
+        from pybmap.types import AudioSource
+        return AudioSource("bluetooth", self.source_mac)
+
+    def paired_devices(self):
+        from pybmap.types import PairedDevice
+        return [
+            PairedDevice("58:1C:F8:51:F3:14", "nuvem", True, True, b""),
+            PairedDevice("C0:6C:0C:19:53:1D", "Daniel’s iPhone", True, False, b""),
+            PairedDevice("80:65:7C:E1:E8:BB", "dan-mac", False, False, b""),
+        ]
+
+    def audio_modes_available(self):
+        return self.modes_served
+
+    def modes(self):
+        raise AssertionError("modes() must not be read when the block is refused")
+
+
+def test_devices_marks_active_source_and_local_host(capsys):
+    cli.cmd_devices(DevicesDevice())
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["58:1C:F8:51:F3:14", "connected", "this", "nuvem"]
+    assert lines[1].split()[:3] == ["*", "C0:6C:0C:19:53:1D", "connected"]
+    assert lines[2].split() == ["80:65:7C:E1:E8:BB", "paired", "dan-mac"]
+
+
+def test_status_json_carries_devices_and_capability(capsys):
+    import json
+    cli.cmd_status_json(DevicesDevice())
+    data = json.loads(capsys.readouterr().out)
+    assert data["audio_modes"] is False
+    assert data["profiles"] == []
+    assert data["source"] == "C0:6C:0C:19:53:1D"
+    assert [d["active"] for d in data["devices"]] == [False, True, False]
+    assert data["devices"][0]["local"] is True
+    assert data["devices"][1]["name"] == "Daniel’s iPhone"
+
+
+def test_status_json_zero_source_means_none(capsys):
+    import json
+    cli.cmd_status_json(DevicesDevice(source_mac="00:00:00:00:00:00"))
+    data = json.loads(capsys.readouterr().out)
+    assert data["source"] is None
+    assert not any(d["active"] for d in data["devices"])
